@@ -18,6 +18,6 @@
 ../Core/Src/ethernetif.c:794:9:ETH_PHY_IO_WriteReg	2
 ../Core/Src/ethernetif.c:808:9:ETH_PHY_IO_GetTick	1
 ../Core/Src/ethernetif.c:817:6:ethernet_link_thread	27
-../Core/Src/ethernetif.c:1060:6:HAL_ETH_RxAllocateCallback	2
-../Core/Src/ethernetif.c:1082:6:HAL_ETH_RxLinkCallback	3
-../Core/Src/ethernetif.c:1122:6:HAL_ETH_TxFreeCallback	1
+../Core/Src/ethernetif.c:1102:6:HAL_ETH_RxAllocateCallback	2
+../Core/Src/ethernetif.c:1124:6:HAL_ETH_RxLinkCallback	3
+../Core/Src/ethernetif.c:1164:6:HAL_ETH_TxFreeCallback	1

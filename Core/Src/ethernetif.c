@@ -914,12 +914,20 @@ void ethernet_link_thread(void* argument)
 
                     if (HAL_ETH_DeInit(&heth) != HAL_OK)
                     {
-                        Error_Handler();
+                    	netif_set_down(netif);
+                    	netif_set_link_down(netif);
+                    	link_up_stable_count = 0U;
+                    	osDelay(1000);
+                    	continue;
                     }
 
                     if (HAL_ETH_Init(&heth) != HAL_OK)
                     {
-                        Error_Handler();
+                    	netif_set_down(netif);
+                    	netif_set_link_down(netif);
+                    	link_up_stable_count = 0U;
+                    	osDelay(1000);
+                    	continue;
                     }
 
                     RxAllocStatus = RX_ALLOC_OK;
@@ -932,17 +940,30 @@ void ethernet_link_thread(void* argument)
                     MACConf.DuplexMode = duplex;
                     MACConf.Speed = speed;
 
-                    if (HAL_ETH_SetMACConfig(
-                            &heth,
-                            &MACConf
-                        ) != HAL_OK)
+                    if (HAL_ETH_SetMACConfig(&heth, &MACConf) != HAL_OK)
                     {
-                        Error_Handler();
+                    	HAL_ETH_Stop_IT(&heth);
+
+                    	netif_set_down(netif);
+                    	netif_set_link_down(netif);
+
+                    	link_up_stable_count = 0U;
+
+                    	osDelay(1000);
+                    	continue;
                     }
 
                     if (HAL_ETH_Start_IT(&heth) != HAL_OK)
                     {
-                        Error_Handler();
+                    	HAL_ETH_Stop_IT(&heth);
+
+                    	netif_set_down(netif);
+                    	netif_set_link_down(netif);
+
+                    	link_up_stable_count = 0U;
+
+                    	osDelay(1000);
+                    	continue;
                     }
 
                     netif_set_up(netif);
@@ -975,12 +996,20 @@ void ethernet_link_thread(void* argument)
 
             if (HAL_ETH_DeInit(&heth) != HAL_OK)
             {
-                Error_Handler();
+            	netif_set_down(netif);
+            	netif_set_link_down(netif);
+            	link_up_stable_count = 0U;
+            	osDelay(1000);
+            	continue;
             }
 
             if (HAL_ETH_Init(&heth) != HAL_OK)
             {
-                Error_Handler();
+            	netif_set_down(netif);
+            	netif_set_link_down(netif);
+            	link_up_stable_count = 0U;
+            	osDelay(1000);
+            	continue;
             }
 
             RxAllocStatus = RX_ALLOC_OK;
@@ -1021,17 +1050,30 @@ void ethernet_link_thread(void* argument)
             MACConf.DuplexMode = duplex;
             MACConf.Speed = speed;
 
-            if (HAL_ETH_SetMACConfig(
-                    &heth,
-                    &MACConf
-                ) != HAL_OK)
+            if (HAL_ETH_SetMACConfig(&heth, &MACConf) != HAL_OK)
             {
-                Error_Handler();
+            	HAL_ETH_Stop_IT(&heth);
+
+            	netif_set_down(netif);
+            	netif_set_link_down(netif);
+
+            	link_up_stable_count = 0U;
+
+            	osDelay(1000);
+            	continue;
             }
 
             if (HAL_ETH_Start_IT(&heth) != HAL_OK)
             {
-                Error_Handler();
+            	HAL_ETH_Stop_IT(&heth);
+
+            	netif_set_down(netif);
+            	netif_set_link_down(netif);
+
+                link_up_stable_count = 0U;
+
+            	osDelay(1000);
+            	continue;
             }
 
             netif_set_up(netif);

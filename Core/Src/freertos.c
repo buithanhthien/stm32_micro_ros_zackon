@@ -770,6 +770,15 @@ void MX_FREERTOS_Init(void) {
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+// Định nghĩa các trạng thái cho State Machine
+typedef enum {
+    UROS_STATE_WAIT_NET = 0,
+    UROS_STATE_WAIT_AGENT,
+    UROS_STATE_CREATE_ENTITIES,
+    UROS_STATE_RUN,
+    UROS_STATE_DESTROY
+} uros_state_t;
+
 void StartDefaultTask(void *argument)
 {
     (void)argument;
@@ -803,14 +812,12 @@ void StartDefaultTask(void *argument)
     g_allocator = rcl_get_default_allocator();
 
     // Create mutex 1 lần
-    if (g_uros_mutex == NULL)
-    {
+    if (g_uros_mutex == NULL) {
         g_uros_mutex = osMutexNew(NULL);
     }
 
     // Create RX task 1 lần
-    if (g_rx_task_handle == NULL)
-    {
+    if (g_rx_task_handle == NULL) {
         const osThreadAttr_t rxTask_attributes = {
             .name = "uROS_RX",
             .stack_size = 1024 * 4,
@@ -820,8 +827,7 @@ void StartDefaultTask(void *argument)
     }
 
     // Create Odom task 1 lần
-    if (g_odom_task_handle == NULL)
-    {
+    if (g_odom_task_handle == NULL) {
         const osThreadAttr_t odomTask_attributes = {
             .name = "uROS_ODOM",
             .stack_size = 1024 * 4,
@@ -830,239 +836,138 @@ void StartDefaultTask(void *argument)
         g_odom_task_handle = osThreadNew(StartMicroRosOdomPubTask, NULL, &odomTask_attributes);
     }
 
-    uint8_t wait_agent_fail_cnt = 0U;
-    bool eth_recovery_done_for_outage = false;
+    // State Machine Variables
+    uros_state_t state = UROS_STATE_WAIT_NET;
+    uint8_t wait_agent_fail_cnt = 0;
+    uint8_t run_ping_fail_cnt = 0;
+    uint32_t last_watchdog_ms = 0;
+    bool eth_recovery_done = false;
 
     for (;;)
     {
-        // update touch nếu cần
+        // Liên tục cập nhật dữ liệu touch (theo code cũ của bạn)
         touch_x = g_touchState.x;
         touch_y = g_touchState.y;
         touch_pressed = g_touchState.pressed;
 
-        // 0) network ready?
-        if (!network_is_ready())
+        switch (state)
         {
-            g_uros_connected = false;
-            g_request_reconnect = false;
-
-            /*
-            * Physical link thực sự mất.
-            * ethernet_link_thread sẽ tự xử lý
-            * LINK DOWN -> LINK UP.
-            */
-            wait_agent_fail_cnt = 0U;
-            eth_recovery_done_for_outage = false;
-
-            osDelay(200);
-            continue;
-        }
-
-        // 1) wait agent
-        if (rmw_uros_ping_agent(100, 2) != RMW_RET_OK)
-        {
-            g_uros_connected = false;
-            g_request_reconnect = false;
-
-            /*
-             * network_is_ready() vẫn TRUE nhưng Agent
-             * không reachable.
-             *
-             * Đây chính là trường hợp có thể xảy ra khi:
-             *
-             * PC reboot
-             * PHY vẫn báo LINK UP
-             * nhưng ETH MAC/DMA/LwIP phía STM32 bị kẹt.
-             */
-            if (wait_agent_fail_cnt < 20U)
-            {
-                wait_agent_fail_cnt++;
-            }
-
-            /*
-             * Force recovery đúng 1 lần trong đợt mất kết nối.
-             *
-             * Một vòng ở đây gồm ping timeout + delay,
-             * nên 20 lần cho PC/card mạng có thời gian ổn định.
-             */
-            if ((wait_agent_fail_cnt >= 20U) &&
-                (!eth_recovery_done_for_outage))
-            {
-                ethernet_request_recovery();
-
-                eth_recovery_done_for_outage = true;
-                wait_agent_fail_cnt = 0U;
-
-                /*
-                 * Cho ethernet_link_thread thời gian:
-                 *
-                 * Stop
-                 * DeInit
-                 * Init
-                 * Start
-                 */
-                osDelay(1000);
-            }
-            else
-            {
-                osDelay(200);
-            }
-
-            continue;
-        }
-
-        /*
-         * Ping Agent thành công.
-         * Kết thúc đợt lỗi hiện tại và cho phép
-         * recovery ở lần mất kết nối tiếp theo.
-         */
-        wait_agent_fail_cnt = 0U;
-        eth_recovery_done_for_outage = false;
-
-        // 2) create entities
-        bool ok = false;
-
-        if (osMutexAcquire(g_uros_mutex, 100) == osOK)
-        {
-            ok = create_entities(
-                &g_support,
-                &g_node,
-                &g_sub_cmdvel,
-                &g_executor,
-                &g_allocator,
-                &g_msg_cmdvel
-            );
-
-            /*
-             * Nếu create fail giữa chừng:
-             * cleanup ngay các object đã được tạo.
-             */
-            if (!ok)
-            {
-                destroy_entities(
-                    &g_executor,
-                    &g_sub_cmdvel,
-                    &g_node,
-                    &g_support
-                );
-            }
-
-            osMutexRelease(g_uros_mutex);
-        }
-
-        if (!ok)
-        {
-            g_uros_connected = false;
-            g_request_reconnect = false;
-
-            osDelay(200);
-            continue;
-        }
-
-        // 3) sync time mỗi lần connect / reconnect
-        if (osMutexAcquire(g_uros_mutex, 100) == osOK)
-        {
-            (void)rmw_uros_sync_session(500);
-            osMutexRelease(g_uros_mutex);
-        }
-
-        g_request_reconnect = false;
-        g_uros_connected = true;
-
-        uint32_t last_ping = osKernelGetTickCount();
-        uint8_t ping_fail_cnt = 0;
-
-        while (1)
-        {
-            touch_x = g_touchState.x;
-            touch_y = g_touchState.y;
-            touch_pressed = g_touchState.pressed;
-
-            if (g_request_reconnect)
-            {
+            case UROS_STATE_WAIT_NET:
+                if (network_is_ready()) {
+                    state = UROS_STATE_WAIT_AGENT;
+                    wait_agent_fail_cnt = 0;
+                } else {
+                    osDelay(200);
+                }
                 break;
+
+           case UROS_STATE_WAIT_AGENT:
+        	   if (!network_is_ready()) {
+        		   state = UROS_STATE_WAIT_NET;
+                   break;
+               }
+
+               // Ping thử agent
+               if (rmw_uros_ping_agent(100, 2) == RMW_RET_OK) {
+            	   state = UROS_STATE_CREATE_ENTITIES;
+                   wait_agent_fail_cnt = 0;
+               } else {
+            	   wait_agent_fail_cnt++;
+
+                   // Nếu ping thất bại 20 lần liên tiếp (MiniPC đang reboot)
+                   if (wait_agent_fail_cnt >= 20U) {
+                	   // TỰ ĐỘNG RESET TOÀN BỘ STM32 ĐỂ LÀM SẠCH RAM VÀ LWIP
+                       NVIC_SystemReset();
+                   } else {
+                	   osDelay(200);
+                   }
             }
+            break;
 
-            uint32_t now_ms = osKernelGetTickCount();
+            case UROS_STATE_CREATE_ENTITIES:
+                if (osMutexAcquire(g_uros_mutex, 100) == osOK) {
+                    bool ok = create_entities(&g_support, &g_node, &g_sub_cmdvel, &g_executor, &g_allocator, &g_msg_cmdvel);
 
-            // ping agent chậm để tránh ảnh hưởng timing
-            if ((now_ms - last_ping) >= 5000U)   // 5 giây
-            {
-                last_ping = now_ms;
-
-                bool ping_ok = false;
-
-                if (network_is_ready())
-                {
-                    if (osMutexAcquire(g_uros_mutex, 100) == osOK)
-                    {
-                        ping_ok =
-                            (rmw_uros_ping_agent(20, 1) == RMW_RET_OK);
-
+                    if (!ok) {
+                        destroy_entities(&g_executor, &g_sub_cmdvel, &g_node, &g_support);
                         osMutexRelease(g_uros_mutex);
+                        state = UROS_STATE_WAIT_AGENT;
+                        osDelay(200);
+                        break;
                     }
-                }
 
-                if (!ping_ok)
-                {
-                    ping_fail_cnt++;
-                }
-                else
-                {
-                    ping_fail_cnt = 0;
-                }
+                    // Đồng bộ thời gian
+                    (void)rmw_uros_sync_session(500);
+                    osMutexRelease(g_uros_mutex);
 
-                if (ping_fail_cnt >= 3U)
-                {
+                    // Thiết lập cờ cho các Task chạy
+                    g_request_reconnect = false;
+                    g_uros_connected = true;
+
+                    // CHỈ RESET CỜ KHI ĐÃ KẾT NỐI ROS THÀNH CÔNG
+                    eth_recovery_done = false;
+
+                    run_ping_fail_cnt = 0;
+                    last_watchdog_ms = osKernelGetTickCount();
+                    state = UROS_STATE_RUN;
+                }
+                break;
+
+            case UROS_STATE_RUN:
+                // Nếu Task Odom hoặc Task Rx phát hiện lỗi -> yêu cầu reconnect
+                if (g_request_reconnect) {
+                    state = UROS_STATE_DESTROY;
                     break;
                 }
-            }
 
-            osDelay(50);
+                uint32_t now_ms = osKernelGetTickCount();
+                // Watchdog: Ping nhẹ mỗi 3 giây để kiểm tra agent có đột ngột biến mất không
+                if ((now_ms - last_watchdog_ms) >= 3000U) {
+                    last_watchdog_ms = now_ms;
+                    bool ping_ok = false;
+
+                    if (network_is_ready()) {
+                        if (osMutexAcquire(g_uros_mutex, 50) == osOK) {
+                            ping_ok = (rmw_uros_ping_agent(20, 1) == RMW_RET_OK);
+                            osMutexRelease(g_uros_mutex);
+                        }
+                    }
+
+                    if (!ping_ok) {
+                        run_ping_fail_cnt++;
+                    } else {
+                        run_ping_fail_cnt = 0;
+                    }
+
+                    // Nếu mất kết nối 3 lần liên tiếp, chuyển sang bước hủy kết nối
+                    if (run_ping_fail_cnt >= 3U) {
+                        dbg_manager_reconnect_cnt++;
+                        g_request_reconnect = true;
+                        state = UROS_STATE_DESTROY;
+                    }
+                }
+                osDelay(50);
+                break;
+
+            case UROS_STATE_DESTROY:
+                // Ngắt cờ để các Task Rx và Odom ngừng chọc vào g_executor ngay lập tức
+                g_uros_connected = false;
+                g_request_reconnect = true;
+
+                osDelay(50); // Cho Rx/Odom task thời gian nhả Mutex ra
+
+                // Chờ lấy được Mutex thì mới hủy thực thể
+                if (osMutexAcquire(g_uros_mutex, osWaitForever) == osOK) {
+                    destroy_entities(&g_executor, &g_sub_cmdvel, &g_node, &g_support);
+                    osMutexRelease(g_uros_mutex);
+                }
+
+                g_request_reconnect = false;
+                wait_agent_fail_cnt = 0;
+                state = UROS_STATE_WAIT_AGENT;
+                osDelay(100);
+                break;
         }
-
-        // Prepare reconnect
-        g_uros_connected = false;
-
-        /*
-         * Giữ reconnect=true trong lúc cleanup
-         * để RX và ODOM worker chắc chắn không đụng micro-ROS.
-         */
-        g_request_reconnect = true;
-
-        dbg_manager_reconnect_cnt++;
-
-        osDelay(50);
-
-        /*
-         * Hai worker đã ngừng sử dụng micro-ROS.
-         * Chờ cho tới khi lấy được mutex,
-         * không được bỏ qua cleanup.
-         */
-        if (osMutexAcquire(
-                g_uros_mutex,
-                osWaitForever
-            ) == osOK)
-        {
-            destroy_entities(
-                &g_executor,
-                &g_sub_cmdvel,
-                &g_node,
-                &g_support
-            );
-
-            osMutexRelease(
-                g_uros_mutex
-            );
-        }
-
-        /*
-         * Cleanup hoàn tất.
-         * Cho phép vòng manager thử tạo session mới.
-         */
-        g_request_reconnect = false;
-
-        osDelay(100);
     }
 }
 
