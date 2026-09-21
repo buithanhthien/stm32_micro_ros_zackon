@@ -1,0 +1,4 @@
+../Core/Src/udp_transport.c:28:6:cubemx_transport_open	48	static
+../Core/Src/udp_transport.c:151:6:cubemx_transport_close	16	static
+../Core/Src/udp_transport.c:164:8:cubemx_transport_write	56	static
+../Core/Src/udp_transport.c:253:8:cubemx_transport_read	104	static
