@@ -1,3 +1,4 @@
 ../Core/Src/motor.c:27:13:Motor_SetDir	24	static
 ../Core/Src/motor.c:43:6:Motor_Init	8	static
 ../Core/Src/motor.c:54:6:Motor_SetSpeed	40	static
+../Core/Src/motor.c:93:6:Apply_Robot_Ramping	32	static

@@ -34,7 +34,8 @@ Core/Src/motor.o: ../Core/Src/motor.c ../Core/Inc/motor.h \
  ../Drivers/STM32F7xx_HAL_Driver/Inc/stm32f7xx_hal_tim_ex.h \
  ../Drivers/STM32F7xx_HAL_Driver/Inc/stm32f7xx_hal_uart.h \
  ../Drivers/STM32F7xx_HAL_Driver/Inc/stm32f7xx_hal_uart_ex.h \
- ../Core/Inc/tim.h ../Core/Inc/main.h ../Core/Inc/gpio.h
+ ../Core/Inc/tim.h ../Core/Inc/main.h ../Core/Inc/gpio.h \
+ ../Core/Inc/robot_params.h ../Core/Inc/pid.h
 ../Core/Inc/motor.h:
 ../Drivers/STM32F7xx_HAL_Driver/Inc/stm32f7xx_hal.h:
 ../Core/Inc/stm32f7xx_hal_conf.h:
@@ -74,3 +75,5 @@ Core/Src/motor.o: ../Core/Src/motor.c ../Core/Inc/motor.h \
 ../Core/Inc/tim.h:
 ../Core/Inc/main.h:
 ../Core/Inc/gpio.h:
+../Core/Inc/robot_params.h:
+../Core/Inc/pid.h:

@@ -29,12 +29,12 @@
 //maximum speed and acceleration of each wheel
 #define MAXSPEED 1.00f
 #define V_MAX               1.00f     // max linear m/s  -- set this one similar to MAXSPEED
-#define V_STEP              0.30f     // d-pad speed
+#define V_STEP              0.50f     // d-pad speed
 
-#define MAXACC 4.0f
+#define MAXACC 2.5f
 
 //ps2 controller constants
-#define W_MAX               1.00f     // max angular rad/s (tune)
+#define W_MAX               2.00f     // max angular rad/s (tune)
 #define W_STEP              0.50f     // d-pad turn rate
 
 #define PS2_TIMEOUT_MS      500

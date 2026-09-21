@@ -8,7 +8,7 @@
 #include "tim.h"    // htim9
 #include "gpio.h"   // HAL_GPIO_WritePin
 #include <stdlib.h> // abs
-
+#include "robot_params.h"
 
 // Map chân DIR
 #define MOTOR1_DIR_GPIO_Port   GPIOF
@@ -88,4 +88,22 @@ void Motor_SetSpeed(MotorId id, int16_t speed)
     }
 
     __HAL_TIM_SET_COMPARE(&htim9, channel, duty_counts);
+}
+
+void Apply_Robot_Ramping(double *current_target, double raw_target)
+{
+    double max_step = (double)MAXACC * (double)DT_TIME;
+
+    if (*current_target < raw_target) {
+        *current_target += max_step;
+        if (*current_target > raw_target) {
+            *current_target = raw_target;
+        }
+    }
+    else if (*current_target > raw_target) {
+        *current_target -= max_step;
+        if (*current_target < raw_target) {
+            *current_target = raw_target;
+        }
+    }
 }

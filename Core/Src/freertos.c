@@ -1339,6 +1339,9 @@ void MotorControlTask(void *argument)
 	const TickType_t period = pdMS_TO_TICKS(MOTORCONTROL_PERIOD_MS);
 	TickType_t lastWake = xTaskGetTickCount();
 
+	static double smoothed_speed1 = 0.0;
+	static double smoothed_speed2 = 0.0;
+
 	for (;;)
 	    {
 			//update thông số PID nếu có thay đổi
@@ -1434,9 +1437,23 @@ void MotorControlTask(void *argument)
 				DesiredSpeed1 = vR_cmd;
 				//////////////////End of applying kick////////////////////////////////////////
 
+				// ==========================================
+				// BỔ SUNG: Áp dụng Velocity Ramping (Làm mượt gia tốc)
+				// ==========================================
+
+				Apply_Robot_Ramping(&smoothed_speed1, DesiredSpeed1);
+				Apply_Robot_Ramping(&smoothed_speed2, DesiredSpeed2);
+
+				// Gán ngược lại giá trị đã được làm mượt gia tốc vào biến đích cho PID
+				DesiredSpeed1 = smoothed_speed1;
+				DesiredSpeed2 = smoothed_speed2;
+				// ==========================================
+
 				PID_Compute(&SpeedPID1);
 				PID_Compute(&SpeedPID2);
+
 				MotorData_Publish(SpeedPIDOut1, SpeedPIDOut2);  //update PWM data for LCD display
+
 				Motor_SetSpeed(MOTOR_1,SpeedPIDOut1);
 				Motor_SetSpeed(MOTOR_2,SpeedPIDOut2);
 			}
