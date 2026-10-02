@@ -41,5 +41,7 @@ u32_t sys_now(void);
 
 /* USER CODE BEGIN 1 */
 
+void ethernet_request_recovery(void);
+
 /* USER CODE END 1 */
 #endif

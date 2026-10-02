@@ -119,6 +119,7 @@ volatile bool g_request_reconnect = false;
 volatile uint32_t dbg_rx_spin_err_cnt = 0;
 volatile uint32_t dbg_pub_odom_cnt = 0;
 volatile uint32_t dbg_manager_reconnect_cnt = 0;
+volatile uint32_t dbg_eth_recovery_cnt = 0;
 //----------------------------------------
 
 volatile uint32_t dbg_cmd_cb_count = 0;
@@ -838,8 +839,12 @@ void StartDefaultTask(void *argument)
 
     // State Machine Variables
     uros_state_t state = UROS_STATE_WAIT_NET;
+
     uint8_t run_ping_fail_cnt = 0;
+    uint8_t wait_agent_fail_cnt = 0;
+
     uint32_t last_watchdog_ms = 0;
+    uint32_t last_eth_recovery_ms = 0;
 
     for (;;)
     {
@@ -859,20 +864,75 @@ void StartDefaultTask(void *argument)
                 break;
 
             case UROS_STATE_WAIT_AGENT:
-                if (!network_is_ready()) {
+            {
+                if (!network_is_ready())
+                {
+                    wait_agent_fail_cnt = 0;
                     state = UROS_STATE_WAIT_NET;
                     break;
                 }
 
-                // The mini PC may stay powered off indefinitely. An absent
-                // Agent is not an MCU fault: keep retrying without resetting
-                // the controller, encoder state or Ethernet driver.
-                if (rmw_uros_ping_agent(100, 2) == RMW_RET_OK) {
+                if (rmw_uros_ping_agent(100, 2) == RMW_RET_OK)
+                {
+                    // Network RX/TX + Agent đều hoạt động
+                    wait_agent_fail_cnt = 0;
+
                     state = UROS_STATE_CREATE_ENTITIES;
-                } else {
-                    osDelay(500);
+                    break;
                 }
+
+                /*
+                * PHY vẫn UP nhưng không nói chuyện được với Agent.
+                *
+                * Không recovery ngay vì lúc mini-PC mới boot
+                * Agent có thể chưa chạy.
+                */
+                if (wait_agent_fail_cnt < 255U)
+                {
+                    wait_agent_fail_cnt++;
+                }
+
+                /*
+                * 20 lần x 500 ms ~= 10 giây.
+                *
+                * Nếu sau khoảng 10 giây vẫn không nhận được
+                * phản hồi thì có khả năng ETH RX/MAC/DMA bị kẹt.
+                */
+                if (wait_agent_fail_cnt >= 20U)
+                {
+                    uint32_t now = osKernelGetTickCount();
+
+                    /*
+                    * Giới hạn tần suất recovery để tránh
+                    * reset Ethernet liên tục khi mini-PC thật sự tắt.
+                    */
+                    if ((now - last_eth_recovery_ms) >= 10000U)
+                    {
+                        last_eth_recovery_ms = now;
+                        
+                        dbg_eth_recovery_cnt++;
+                        ethernet_request_recovery();
+                    }
+
+                    wait_agent_fail_cnt = 0;
+
+                    /*
+                    * Cho ethernet_link_thread đủ thời gian:
+                    *
+                    * HAL_ETH_Stop_IT
+                    * HAL_ETH_DeInit
+                    * HAL_ETH_Init
+                    * HAL_ETH_Start_IT
+                    */
+                    osDelay(1500);
+
+                    state = UROS_STATE_WAIT_NET;
+                    break;
+                }
+
+                osDelay(500);
                 break;
+            }
 
             case UROS_STATE_CREATE_ENTITIES:
                 if (osMutexAcquire(g_uros_mutex, 100) == osOK) {
