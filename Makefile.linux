@@ -1,0 +1,28 @@
+# Run from the project root: make -f Makefile.linux -j4
+include tools/sources.mk
+TOOL_ROOT := $(CURDIR)/.tools/root/usr
+CC := $(TOOL_ROOT)/bin/arm-none-eabi-gcc
+OBJCOPY := $(TOOL_ROOT)/bin/arm-none-eabi-objcopy
+SIZE := $(TOOL_ROOT)/bin/arm-none-eabi-size
+BUILD := build-linux/app
+LIBDIR := micro_ros_stm32cubemx_utils/microros_static_library_ide/libmicroros
+CPU := -mcpu=cortex-m7 -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb
+CFLAGS := $(CPU) -std=gnu11 -g3 -O0 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F756xx -ffunction-sections -fdata-sections -Wall --specs=nano.specs $(INCLUDES)
+OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(basename $(SOURCES))))
+ELF := $(BUILD)/MotorControlwithMicroROS.elf
+.PHONY: all
+all: $(ELF) $(ELF:.elf=.bin) $(ELF:.elf=.hex)
+$(BUILD)/%.o: %.c Makefile.linux tools/sources.mk
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+$(BUILD)/%.o: %.s Makefile.linux
+	@mkdir -p $(@D)
+	$(CC) $(CPU) -g3 -x assembler-with-cpp -c $< -o $@
+$(ELF): $(OBJECTS) $(LIBDIR)/libmicroros.a STM32F756ZGTX_FLASH.ld
+	$(CC) $(CPU) -TSTM32F756ZGTX_FLASH.ld --specs=nosys.specs --specs=nano.specs -static -Wl,--gc-sections,-Map=$(BUILD)/firmware.map -u _printf_float $(OBJECTS) -L$(LIBDIR) -Wl,--start-group -lmicroros -lc -lm -Wl,--end-group -o $@
+	$(SIZE) $@
+$(BUILD)/%.bin: $(BUILD)/%.elf
+	$(OBJCOPY) -O binary $< $@
+$(BUILD)/%.hex: $(BUILD)/%.elf
+	$(OBJCOPY) -O ihex $< $@
+-include $(OBJECTS:.o=.d)

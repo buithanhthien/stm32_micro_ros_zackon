@@ -1,2 +1,0 @@
-../Core/Src/lwip.c:63:6:MX_LWIP_Init	1
-../Core/Src/lwip.c:131:13:ethernet_link_status_updated	1

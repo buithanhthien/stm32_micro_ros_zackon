@@ -74,8 +74,8 @@ all: main-build
 main-build: MotorControlwithMicroROS.elf secondary-outputs
 
 # Tool invocations
-MotorControlwithMicroROS.elf MotorControlwithMicroROS.map: $(OBJS) $(USER_OBJS) D:\workspace\MotorControlwithMicroROS\STM32F756ZGTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "MotorControlwithMicroROS.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m7 -T"D:\workspace\MotorControlwithMicroROS\STM32F756ZGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="MotorControlwithMicroROS.map" -Wl,--gc-sections -static -L"D:/workspace/MotorControlwithMicroROS/micro_ros_stm32cubemx_utils/microros_static_library_ide/libmicroros" -u _printf_float --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+MotorControlwithMicroROS.elf MotorControlwithMicroROS.map: $(OBJS) $(USER_OBJS) /home/khoaiuh/stm32_micro_ros_zackon/STM32F756ZGTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "MotorControlwithMicroROS.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m7 -T"/home/khoaiuh/stm32_micro_ros_zackon/STM32F756ZGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="MotorControlwithMicroROS.map" -Wl,--gc-sections -static -L"/home/khoaiuh/stm32_micro_ros_zackon/micro_ros_stm32cubemx_utils/microros_static_library_ide/libmicroros" -u _printf_float --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=Micro-ROS Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=khoaiuh
+Environment="RCUTILS_CONSOLE_STDOUT_LINE_BUFFERED=1"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/bin/bash -c "source /opt/ros/jazzy/setup.bash && source /home/khoaiuh/zackon_build_up/install/setup.bash && exec ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888"
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -4,9 +4,20 @@ EWARM
 Middlewares
 .mxproject
 Makefile
-*.s
-*.ld
 build
 .vscode
 libmicroros
 custombuild
+.tools/
+build-linux/
+# STM32CubeIDE build artifacts
+/Debug/**/*.o
+/Debug/**/*.d
+/Debug/**/*.su
+/Debug/**/*.cyclo
+/Debug/**/*.elf
+/Debug/**/*.map
+/Debug/**/*.hex
+/Debug/**/*.bin
+/Debug/**/*.list
+/Debug/**/*.size.stdout

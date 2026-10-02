@@ -790,7 +790,7 @@ void StartDefaultTask(void *argument)
     osDelay(300);
 
     // 2) micro-ROS custom UDP transport
-    static const char *agent_ip = "192.168.1.150";
+    static const char *agent_ip = "192.168.4.150";
 
     rmw_uros_set_custom_transport(
         false,
@@ -838,10 +838,8 @@ void StartDefaultTask(void *argument)
 
     // State Machine Variables
     uros_state_t state = UROS_STATE_WAIT_NET;
-    uint8_t wait_agent_fail_cnt = 0;
     uint8_t run_ping_fail_cnt = 0;
     uint32_t last_watchdog_ms = 0;
-    bool eth_recovery_done = false;
 
     for (;;)
     {
@@ -855,34 +853,26 @@ void StartDefaultTask(void *argument)
             case UROS_STATE_WAIT_NET:
                 if (network_is_ready()) {
                     state = UROS_STATE_WAIT_AGENT;
-                    wait_agent_fail_cnt = 0;
                 } else {
                     osDelay(200);
                 }
                 break;
 
-           case UROS_STATE_WAIT_AGENT:
-        	   if (!network_is_ready()) {
-        		   state = UROS_STATE_WAIT_NET;
-                   break;
-               }
+            case UROS_STATE_WAIT_AGENT:
+                if (!network_is_ready()) {
+                    state = UROS_STATE_WAIT_NET;
+                    break;
+                }
 
-               // Ping thử agent
-               if (rmw_uros_ping_agent(100, 2) == RMW_RET_OK) {
-            	   state = UROS_STATE_CREATE_ENTITIES;
-                   wait_agent_fail_cnt = 0;
-               } else {
-            	   wait_agent_fail_cnt++;
-
-                   // Nếu ping thất bại 20 lần liên tiếp (MiniPC đang reboot)
-                   if (wait_agent_fail_cnt >= 20U) {
-                	   // TỰ ĐỘNG RESET TOÀN BỘ STM32 ĐỂ LÀM SẠCH RAM VÀ LWIP
-                       NVIC_SystemReset();
-                   } else {
-                	   osDelay(200);
-                   }
-            }
-            break;
+                // The mini PC may stay powered off indefinitely. An absent
+                // Agent is not an MCU fault: keep retrying without resetting
+                // the controller, encoder state or Ethernet driver.
+                if (rmw_uros_ping_agent(100, 2) == RMW_RET_OK) {
+                    state = UROS_STATE_CREATE_ENTITIES;
+                } else {
+                    osDelay(500);
+                }
+                break;
 
             case UROS_STATE_CREATE_ENTITIES:
                 if (osMutexAcquire(g_uros_mutex, 100) == osOK) {
@@ -903,9 +893,6 @@ void StartDefaultTask(void *argument)
                     // Thiết lập cờ cho các Task chạy
                     g_request_reconnect = false;
                     g_uros_connected = true;
-
-                    // CHỈ RESET CỜ KHI ĐÃ KẾT NỐI ROS THÀNH CÔNG
-                    eth_recovery_done = false;
 
                     run_ping_fail_cnt = 0;
                     last_watchdog_ms = osKernelGetTickCount();
@@ -963,7 +950,6 @@ void StartDefaultTask(void *argument)
                 }
 
                 g_request_reconnect = false;
-                wait_agent_fail_cnt = 0;
                 state = UROS_STATE_WAIT_AGENT;
                 osDelay(100);
                 break;
@@ -984,7 +970,7 @@ void StartDefaultTask(void *argument)
 //  osDelay(300);
 //
 //  // 2) micro-ROS custom UDP transport
-//  static const char * agent_ip = "192.168.1.150";
+//  static const char * agent_ip = "192.168.4.150";
 //
 //  rmw_uros_set_custom_transport(
 //    false,
@@ -1187,7 +1173,7 @@ void StartDefaultTask(void *argument)
 //    MX_LWIP_Init();
 //    osDelay(300);
 //
-//    static const char * agent_ip = "192.168.1.150";
+//    static const char * agent_ip = "192.168.4.150";
 //
 //    rmw_uros_set_custom_transport(
 //        false,
