@@ -22,5 +22,6 @@ typedef enum {
 void Motor_Init(void);
 void Motor_SetSpeed(MotorId id, int16_t speed);
 void Apply_Robot_Ramping(double *current_target, double raw_target);
+void Apply_Robot_RampingDt(double *current_target, double raw_target, double dt_s);
 
 #endif /* INC_MOTOR_H_ */

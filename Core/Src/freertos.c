@@ -136,6 +136,33 @@ volatile uint32_t last_cmdvel_ms = 0;
 volatile uint8_t autonomous_MODE = 0;
 volatile uint32_t num_timeout_ROScmd = 0;
 
+// Command mailbox: Teleop owns raw targets; MotorControl owns DesiredSpeed.
+// Protect the pair because a double is not an atomic transfer on this MCU.
+static volatile double motor_target1 = 0.0, motor_target2 = 0.0;
+static void publish_motor_targets(double right, double left)
+{
+    taskENTER_CRITICAL();
+    motor_target1 = right;
+    motor_target2 = left;
+    taskEXIT_CRITICAL();
+}
+
+// RAM-only trace, no ROS/UART traffic. Freeze with dbg_motor_trace_freeze=1.
+// sequence is committed last; write_count identifies the next ring slot.
+typedef struct {
+    uint32_t sequence, ms, dt_ms, encoder_dt_ms, cmd_count, cmd_age_ms;
+    uint32_t gap_ms, gap_max_ms, gap_over_500ms, timeouts;
+    float cmd_v, cmd_w, raw1, raw2, desired1, desired2, measured1, measured2;
+    float pwm1, pwm2;
+    uint32_t pid_updated, autonomous;
+} MotorTrace;
+volatile MotorTrace dbg_motor_trace[128];
+volatile uint32_t dbg_motor_trace_write_count = 0;
+volatile uint32_t dbg_motor_trace_freeze = 0;
+volatile uint32_t dbg_motor_dt_ms = 0, dbg_motor_dt_max_ms = 0;
+volatile uint32_t dbg_encoder_dt_ms = 0, dbg_encoder_dt_max_ms = 0;
+
+
 
 ////Live debug variables - remove if done///////////////////
 volatile uint32_t age_ros_check;   //just to check ROS--remove if unnecessary
@@ -176,6 +203,8 @@ static float g_theta_ref = 0.0f;
 static float g_e_theta_prev = 0.0f;
 static uint8_t g_heading_hold_en = 0;
 static uint32_t g_heading_div_ctr = 0;
+static float g_heading_omega_corr = 0.0f;
+static float g_heading_elapsed_s = 0.0f;
 //////////////////////////////////////////////////
 
 volatile int g_activeCell = -1;   // biến dùng cho update lcd
@@ -281,7 +310,7 @@ static uint32_t stuck_ms = 0;
 
 static inline uint32_t ms_now(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
 
-void apply_stiction_kick(float *vL_cmd, float *vR_cmd, float vL_meas, float vR_meas)
+void apply_stiction_kick(float *vL_cmd, float *vR_cmd, float vL_meas, float vR_meas, uint32_t dt_ms)
 {
     const float CMD_EPS   = 0.02f;   // command considered "wants to move"
     const float MEAS_EPS  = 0.01f;   // measured considered "still not moving"
@@ -294,7 +323,9 @@ void apply_stiction_kick(float *vL_cmd, float *vR_cmd, float vL_meas, float vR_m
     float v_avg_meas = 0.5f * (vL_meas + vR_meas);
 
     if (fabsf(v_avg_cmd) > CMD_EPS && fabsf(v_avg_meas) < MEAS_EPS) {
-        stuck_ms += MOTORCONTROL_PERIOD_MS;
+        if (stuck_ms < STUCK_TIME_MS) {
+            stuck_ms += dt_ms;
+        }
         if (stuck_ms >= STUCK_TIME_MS) {
             float add = copysignf(KICK_ADD, v_avg_cmd);
             add = clampf(add, -KICK_MAX, KICK_MAX);
@@ -1355,15 +1386,27 @@ void EncoderTask(void *argument)
 {
 	const TickType_t period = pdMS_TO_TICKS(ENCODER_PERIOD_MS);
 	TickType_t lastWake = xTaskGetTickCount();
+    TickType_t lastSample = lastWake;
 
   for(;;)
   {
+    TickType_t sample = xTaskGetTickCount();
+    TickType_t elapsed = sample - lastSample;
+    if (elapsed == 0) {
+        vTaskDelayUntil(&lastWake, period);
+        continue;
+    }
+    lastSample = sample;
+    float encoder_dt = (float)elapsed / configTICK_RATE_HZ;
+    dbg_encoder_dt_ms = elapsed * portTICK_PERIOD_MS;
+    if (dbg_encoder_dt_ms > dbg_encoder_dt_max_ms)
+        dbg_encoder_dt_max_ms = dbg_encoder_dt_ms;
     // Đọc count mở rộng
 	g_encCount1 = Encoder_GetCount(ENCODER_1);
     g_encCount2 = Encoder_GetCount(ENCODER_2);
 
-    g_speed1_mps = Encoder_GetSpeed_mps(ENCODER_1,DT_TIME);
-    g_speed2_mps = Encoder_GetSpeed_mps(ENCODER_2,DT_TIME);
+    g_speed1_mps = Encoder_GetSpeed_mps(ENCODER_1,encoder_dt);
+    g_speed2_mps = Encoder_GetSpeed_mps(ENCODER_2,encoder_dt);
 
     CurSpeed1 = g_speed1_mps;
     CurSpeed2 = g_speed2_mps;
@@ -1372,7 +1415,7 @@ void EncoderTask(void *argument)
     float vR_meas = CurSpeed1;
 
     float theta_dot = (vR_meas - vL_meas) / WHEEL_BASE_M;
-    g_theta = wrap_pi(g_theta + theta_dot * DT_TIME);
+    g_theta = wrap_pi(g_theta + theta_dot * encoder_dt);
 
     EncData_Publish(g_encCount1, g_encCount2, g_speed1_mps, g_speed2_mps, DesiredSpeed1, DesiredSpeed2);
 
@@ -1385,12 +1428,21 @@ void MotorControlTask(void *argument)
 	const TickType_t period = pdMS_TO_TICKS(MOTORCONTROL_PERIOD_MS);
 	TickType_t lastWake = xTaskGetTickCount();
 
+	TickType_t lastStep = lastWake;
 	static double smoothed_speed1 = 0.0;
 	static double smoothed_speed2 = 0.0;
 
 	for (;;)
 	    {
-			//update thông số PID nếu có thay đổi
+			TickType_t step = xTaskGetTickCount();
+            TickType_t elapsed = step - lastStep;
+            lastStep = step;
+            dbg_motor_dt_ms = elapsed * portTICK_PERIOD_MS;
+            if (dbg_motor_dt_ms > dbg_motor_dt_max_ms)
+                dbg_motor_dt_max_ms = dbg_motor_dt_ms;
+            // Never compensate a missed deadline with a large command jump.
+            float ramp_dt = (float)(elapsed > period ? period : elapsed) / configTICK_RATE_HZ;
+            //update thông số PID nếu có thay đổi
 			if (pid_update_pending)
 			{
 				if (pid_mutex) xSemaphoreTake(pid_mutex, pdMS_TO_TICKS(2));
@@ -1413,8 +1465,12 @@ void MotorControlTask(void *argument)
 				Motor_SetSpeed(MOTOR_2,PosPIDOut2);
 			} else {
 				//Decide whether to enable heading hold (straight mode detection with latch)
-				float vL_ref_cmd = DesiredSpeed2;
-				float vR_ref_cmd = DesiredSpeed1;
+				taskENTER_CRITICAL();
+                float raw1 = motor_target1;
+                float raw2 = motor_target2;
+                taskEXIT_CRITICAL();
+                float vL_ref_cmd = raw2;
+                float vR_ref_cmd = raw1;
 
 				float v_avg_cmd = 0.5f * (vL_ref_cmd + vR_ref_cmd);
 				float dv_cmd    = (vR_ref_cmd - vL_ref_cmd);
@@ -1432,22 +1488,27 @@ void MotorControlTask(void *argument)
 				g_heading_hold_en = want_heading_hold;
 
 				//Heading PD outer loop (run every 20 ms), then modify DesiredSpeed1/2
-				float omega_corr = 0.0f;
+				float omega_corr = g_heading_omega_corr;
 
 				if (g_heading_hold_en) {
 
+				    g_heading_elapsed_s += (float)elapsed / configTICK_RATE_HZ;
 				    // Run heading controller at slower rate
 				    g_heading_div_ctr++;
 				    if (g_heading_div_ctr >= HEADING_DIV) {
 				        g_heading_div_ctr = 0;
 
 				        float e_theta = wrap_pi(g_theta_ref - g_theta);
-				        float de      = (e_theta - g_e_theta_prev) / HEADING_DT;
+				        float de      = (g_heading_elapsed_s > 0.0f) ?
+                            (e_theta - g_e_theta_prev) / g_heading_elapsed_s : 0.0f;
 
 				        omega_corr = HEADING_KP * e_theta + HEADING_KD * de;
 				        omega_corr = clampf(omega_corr, -OMEGA_CORR_MAX, OMEGA_CORR_MAX);
 
 				        g_e_theta_prev = e_theta;
+                        g_heading_elapsed_s = 0.0f;
+                        g_heading_omega_corr = omega_corr;
+                    }
 
 				        // Convert omega correction -> wheel linear speed offsets
 				        // vR = v + omega*L/2 ; vL = v - omega*L/2
@@ -1458,10 +1519,11 @@ void MotorControlTask(void *argument)
 
 				        vR_ref_cmd = v_avg + v_corr;
 				        vL_ref_cmd = v_avg - v_corr;
-				    }
-				    // else: keep last computed vL_ref_cmd/vR_ref_cmd from previous heading tick
+
 				} else {
 				    g_heading_div_ctr = 0;
+                    g_heading_omega_corr = 0.0f;
+                    g_heading_elapsed_s = 0.0f;
 				}
 
 				DesiredSpeed2 = vL_ref_cmd;
@@ -1477,31 +1539,56 @@ void MotorControlTask(void *argument)
 				float vL_meas = CurSpeed2;
 				float vR_meas = CurSpeed1;
 
-				apply_stiction_kick(&vL_cmd, &vR_cmd, vL_meas, vR_meas);
+				apply_stiction_kick(&vL_cmd, &vR_cmd, vL_meas, vR_meas, dbg_motor_dt_ms);
 
-				DesiredSpeed2 = vL_cmd;
-				DesiredSpeed1 = vR_cmd;
+				// Heading and kick must respect the existing wheel speed limit too.
+				// Clamp before ramping so the acceleration bound still applies.
+				DesiredSpeed2 = clampf(vL_cmd, -MAXSPEED, MAXSPEED);
+				DesiredSpeed1 = clampf(vR_cmd, -MAXSPEED, MAXSPEED);
 				//////////////////End of applying kick////////////////////////////////////////
 
 				// ==========================================
 				// BỔ SUNG: Áp dụng Velocity Ramping (Làm mượt gia tốc)
 				// ==========================================
 
-				Apply_Robot_Ramping(&smoothed_speed1, DesiredSpeed1);
-				Apply_Robot_Ramping(&smoothed_speed2, DesiredSpeed2);
+				Apply_Robot_RampingDt(&smoothed_speed1, DesiredSpeed1, ramp_dt);
+				Apply_Robot_RampingDt(&smoothed_speed2, DesiredSpeed2, ramp_dt);
 
 				// Gán ngược lại giá trị đã được làm mượt gia tốc vào biến đích cho PID
 				DesiredSpeed1 = smoothed_speed1;
 				DesiredSpeed2 = smoothed_speed2;
 				// ==========================================
 
-				PID_Compute(&SpeedPID1);
-				PID_Compute(&SpeedPID2);
+				uint32_t updated = PID_Compute(&SpeedPID1);
+				updated |= (uint32_t)PID_Compute(&SpeedPID2) << 1;
 
 				MotorData_Publish(SpeedPIDOut1, SpeedPIDOut2);  //update PWM data for LCD display
 
 				Motor_SetSpeed(MOTOR_1,SpeedPIDOut1);
 				Motor_SetSpeed(MOTOR_2,SpeedPIDOut2);
+                if (!dbg_motor_trace_freeze) {
+                    uint32_t n = dbg_motor_trace_write_count;
+                    volatile MotorTrace *t = &dbg_motor_trace[n % 128U];
+                    t->ms = step * portTICK_PERIOD_MS;
+                    t->dt_ms = dbg_motor_dt_ms;
+                    t->encoder_dt_ms = dbg_encoder_dt_ms;
+                    t->cmd_count = dbg_cmd_cb_count;
+                    t->cmd_age_ms = t->ms - last_cmdvel_ms;
+                    t->gap_ms = dbg_cmd_gap_ms;
+                    t->gap_max_ms = dbg_cmd_gap_max_ms;
+                    t->gap_over_500ms = dbg_cmd_gap_over_500ms;
+                    t->timeouts = num_timeout_ROScmd;
+                    t->cmd_v = dbg_last_cmd_v; t->cmd_w = dbg_last_cmd_w;
+                    t->raw1 = raw1; t->raw2 = raw2;
+                    t->desired1 = DesiredSpeed1; t->desired2 = DesiredSpeed2;
+                    t->measured1 = CurSpeed1; t->measured2 = CurSpeed2;
+                    t->pwm1 = (int16_t)SpeedPIDOut1; t->pwm2 = (int16_t)SpeedPIDOut2;
+                    t->pid_updated = updated; t->autonomous = autonomous_MODE;
+                    __DMB();
+                    t->sequence = n;
+                    dbg_motor_trace_write_count = n + 1U;
+                }
+
 			}
 
 			vTaskDelayUntil(&lastWake, period);
@@ -1563,6 +1650,17 @@ static bool microros_odom_init(rcl_node_t *node)
         g_odom_msg_initialized = false;
         g_odom_pub_initialized = false;
 
+        return false;
+    }
+
+    // Bound reliable ACK waiting while g_uros_mutex is held. A long
+    // default wait can stall both raw odometry and command reception.
+    if (rmw_uros_set_publisher_session_timeout(rcl_publisher_get_rmw_handle(&odom_pub), 20) != RMW_RET_OK)
+    {
+        (void)rcl_publisher_fini(&odom_pub, node);
+        nav_msgs__msg__Odometry__fini(&odom_msg);
+        g_odom_msg_initialized = false;
+        g_odom_pub_initialized = false;
         return false;
     }
 
@@ -1673,7 +1771,7 @@ static uint32_t millis_void(void)
 	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-// ===== Callback /cmd_vel: tính DesiredSpeed1/2 cho PID =====
+// ===== Callback /cmd_vel: publish raw ROS wheel commands =====
 static void cmdvel_cb(const void * msgin)
 {
 	dbg_cmdvel_cb_cnt++;
@@ -1681,9 +1779,9 @@ static void cmdvel_cb(const void * msgin)
     const geometry_msgs__msg__Twist *m = (const geometry_msgs__msg__Twist *) msgin;
     if (m == NULL) return;
 
-    uint32_t now = osKernelGetTickCount();
+    uint32_t now = millis_void();
 
-	if (dbg_last_cmdvel_ms != 0U) {
+	if (dbg_cmd_cb_count != 0U) {
 		dbg_cmd_gap_ms = now - dbg_last_cmdvel_ms;
 		if (dbg_cmd_gap_ms > dbg_cmd_gap_max_ms) {
 			dbg_cmd_gap_max_ms = dbg_cmd_gap_ms;
@@ -1716,11 +1814,13 @@ static void cmdvel_cb(const void * msgin)
     float v_r = v + (w * WHEEL_BASE_M * 0.5f);
     float v_l = v - (w * WHEEL_BASE_M * 0.5f);
 
+    taskENTER_CRITICAL();
     Spd1_cmdfromROS = v_l;
     Spd2_cmdfromROS = v_r;
 
     last_cmdvel_ms  = millis_void();
     autonomous_MODE = 1;
+    taskEXIT_CRITICAL();
 
 }
 
@@ -1899,13 +1999,15 @@ void StartTeleopTask(void *argument)
         }
 
         // Use the SAME clock as last_cmdvel_ms
-        uint32_t now_ms = millis_void();
+        uint32_t now_ms;
 
         // Default lock (manual path)
         float v_cmd = 0.0f;
         float w_cmd = 0.0f;
         bool enabled = false;
 
+        taskENTER_CRITICAL();
+        now_ms = millis_void();
         // ---- ROS cmd watchdog: if no cmd_vel -> force manual ----
         if (autonomous_MODE) {
             uint32_t age_ros = now_ms - last_cmdvel_ms;
@@ -1929,12 +2031,14 @@ void StartTeleopTask(void *argument)
             v_r = clampf(v_r, -V_MAX, +V_MAX);
 
             // Keep your mapping (as in your autonomous block)
-            DesiredSpeed1 = v_r;
-            DesiredSpeed2 = v_l;
+            publish_motor_targets(v_r, v_l);
+            taskEXIT_CRITICAL();
 
             osDelay(10);
             continue; // bypass manual logic below
         }
+
+        taskEXIT_CRITICAL();
 
         // ---- decide enable (L1) and manual commands ----
         if (got && st.ok) {
@@ -1997,8 +2101,8 @@ void StartTeleopTask(void *argument)
         v_r = clampf(v_r, -V_MAX, +V_MAX);
         v_l = clampf(v_l, -V_MAX, +V_MAX);
 
-        DesiredSpeed1 = v_l;   // left
-        DesiredSpeed2 = v_r;   // right
+        // Preserve the existing manual mapping; verify physically before changing.
+        publish_motor_targets(v_l, v_r);
 
         osDelay(10);
     }
@@ -2192,4 +2296,3 @@ void StartMicroRosOdomPubTask(void *argument)
     }
 }
 /* USER CODE END Application */
-

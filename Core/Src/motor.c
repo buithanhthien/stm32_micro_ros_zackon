@@ -92,7 +92,13 @@ void Motor_SetSpeed(MotorId id, int16_t speed)
 
 void Apply_Robot_Ramping(double *current_target, double raw_target)
 {
-    double max_step = (double)MAXACC * (double)DT_TIME;
+    Apply_Robot_RampingDt(current_target, raw_target, DT_TIME);
+}
+
+void Apply_Robot_RampingDt(double *current_target, double raw_target, double dt_s)
+{
+    if (!(dt_s > 0.0)) return;
+    double max_step = (double)MAXACC * dt_s; // m/s^2 * seconds = m/s
 
     if (*current_target < raw_target) {
         *current_target += max_step;

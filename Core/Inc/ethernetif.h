@@ -20,6 +20,7 @@
 
 #ifndef __ETHERNETIF_H__
 #define __ETHERNETIF_H__
+#include <stdint.h>
 #include "lwip/err.h"
 #include "lwip/netif.h"
 #include "cmsis_os.h"
@@ -42,6 +43,19 @@ u32_t sys_now(void);
 /* USER CODE BEGIN 1 */
 
 void ethernet_request_recovery(void);
+
+extern volatile uint32_t dbg_eth_rx_alloc_fail_cnt;
+extern volatile uint32_t dbg_eth_rx_invalid_free_cnt;
+extern volatile uint32_t dbg_eth_rx_alloc_status;
+extern volatile uint32_t dbg_eth_rx_pool_in_use;
+extern volatile uint32_t dbg_eth_rx_desc_ready;
+extern volatile uint32_t dbg_eth_dma_error_cnt;
+extern volatile uint32_t dbg_eth_last_dma_error;
+extern volatile uint32_t dbg_eth_recovery_attempt_cnt;
+extern volatile uint32_t dbg_eth_recovery_success_cnt;
+extern volatile uint32_t dbg_eth_recovery_fail_cnt;
+extern volatile uint32_t dbg_eth_last_recovery_stage;
+extern volatile uint32_t dbg_eth_link_ready;
 
 /* USER CODE END 1 */
 #endif

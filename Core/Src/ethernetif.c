@@ -28,6 +28,7 @@
 #include "lwip/ethip6.h"
 #include "lan8742.h"
 #include <string.h>
+#include <stdbool.h>
 #include "cmsis_os.h"
 #include "lwip/tcpip.h"
 
@@ -52,6 +53,8 @@
 /* ETH Setting  */
 #define ETH_DMA_TRANSMIT_TIMEOUT               ( 20U )
 #define ETH_TX_BUFFER_MAX             ((ETH_TX_DESC_CNT) * 2U)
+#define ETH_DMA_STOP_TIMEOUT_MS       (100U)
+#define ETH_RECOVERY_RETRY_MS         (1000U)
 
 /* USER CODE BEGIN 1 */
 volatile uintptr_t addr_rx_desc = 0;
@@ -99,8 +102,36 @@ typedef struct
 #define ETH_RX_BUFFER_CNT             12U
 LWIP_MEMPOOL_DECLARE(RX_POOL, ETH_RX_BUFFER_CNT, sizeof(RxBuff_t), "Zero-copy RX PBUF pool");
 
+typedef enum
+{
+  RX_OWNER_DRIVER = 1U,
+  RX_OWNER_LWIP = 2U
+} RxOwnerTypeDef;
+
+typedef struct
+{
+  struct pbuf_custom *pbuf;
+  uint8_t owner;
+} RxBufferTrackTypeDef;
+
 /* Variable Definitions */
-static uint8_t RxAllocStatus;
+static volatile uint8_t RxAllocStatus;
+static RxBufferTrackTypeDef g_rx_buffers[ETH_RX_BUFFER_CNT];
+static osMutexId_t g_eth_io_mutex;
+static osThreadId_t g_eth_input_thread;
+
+volatile uint32_t dbg_eth_rx_alloc_fail_cnt = 0U;
+volatile uint32_t dbg_eth_rx_invalid_free_cnt = 0U;
+volatile uint32_t dbg_eth_rx_alloc_status = RX_ALLOC_OK;
+volatile uint32_t dbg_eth_rx_pool_in_use = 0U;
+volatile uint32_t dbg_eth_rx_desc_ready = 0U;
+volatile uint32_t dbg_eth_dma_error_cnt = 0U;
+volatile uint32_t dbg_eth_last_dma_error = 0U;
+volatile uint32_t dbg_eth_recovery_attempt_cnt = 0U;
+volatile uint32_t dbg_eth_recovery_success_cnt = 0U;
+volatile uint32_t dbg_eth_recovery_fail_cnt = 0U;
+volatile uint32_t dbg_eth_last_recovery_stage = 0U;
+volatile uint32_t dbg_eth_link_ready = 0U;
 
 #if defined ( __ICCARM__ ) /*!< IAR Compiler */
 
@@ -182,6 +213,409 @@ lan8742_IOCtx_t  LAN8742_IOCtx = {ETH_PHY_IO_Init,
 /* Private functions ---------------------------------------------------------*/
 void pbuf_free_custom(struct pbuf *p);
 
+static uint32_t eth_enter_critical(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  return primask;
+}
+
+static void eth_exit_critical(uint32_t primask)
+{
+  __set_PRIMASK(primask);
+}
+
+static int32_t eth_rx_track_find(const struct pbuf_custom *pbuf)
+{
+  uint32_t i;
+
+  for (i = 0U; i < ETH_RX_BUFFER_CNT; i++)
+  {
+    if (g_rx_buffers[i].pbuf == pbuf)
+    {
+      return (int32_t)i;
+    }
+  }
+
+  return -1;
+}
+
+static bool eth_rx_track_add(struct pbuf_custom *pbuf)
+{
+  uint32_t i;
+  uint32_t primask = eth_enter_critical();
+
+  for (i = 0U; i < ETH_RX_BUFFER_CNT; i++)
+  {
+    if (g_rx_buffers[i].pbuf == NULL)
+    {
+      g_rx_buffers[i].pbuf = pbuf;
+      g_rx_buffers[i].owner = RX_OWNER_DRIVER;
+      dbg_eth_rx_pool_in_use++;
+      eth_exit_critical(primask);
+      return true;
+    }
+  }
+
+  eth_exit_critical(primask);
+  return false;
+}
+
+static bool eth_rx_track_transfer_to_lwip(struct pbuf *p)
+{
+  bool tracked = true;
+  uint32_t primask = eth_enter_critical();
+
+  for (; p != NULL; p = p->next)
+  {
+    int32_t slot = eth_rx_track_find((const struct pbuf_custom *)p);
+    if (slot < 0 || g_rx_buffers[slot].owner != RX_OWNER_DRIVER)
+    {
+      tracked = false;
+      dbg_eth_rx_invalid_free_cnt++;
+      continue;
+    }
+
+    g_rx_buffers[slot].owner = RX_OWNER_LWIP;
+  }
+
+  eth_exit_critical(primask);
+  return tracked;
+}
+
+static bool eth_rx_is_driver_owned(const struct pbuf *p)
+{
+  bool driver_owned = false;
+  uint32_t primask = eth_enter_critical();
+  int32_t slot = eth_rx_track_find((const struct pbuf_custom *)p);
+
+  if (slot >= 0 && g_rx_buffers[slot].owner == RX_OWNER_DRIVER)
+  {
+    driver_owned = true;
+  }
+  else
+  {
+    dbg_eth_rx_invalid_free_cnt++;
+  }
+
+  eth_exit_critical(primask);
+  return driver_owned;
+}
+
+static bool eth_rx_chain_is_driver_owned(const struct pbuf *p)
+{
+  for (; p != NULL; p = p->next)
+  {
+    if (!eth_rx_is_driver_owned(p))
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static void eth_update_rx_descriptor_count(void)
+{
+  uint32_t i;
+  uint32_t ready = 0U;
+  uintptr_t first_buffer = 0U;
+
+  for (i = 0U; i < ETH_RX_DESC_CNT; i++)
+  {
+    ETH_DMADescTypeDef *desc = (ETH_DMADescTypeDef *)heth.RxDescList.RxDesc[i];
+    if (desc != NULL && desc->BackupAddr0 != 0U && desc->DESC2 != 0U)
+    {
+      ready++;
+      if (first_buffer == 0U)
+      {
+        first_buffer = desc->BackupAddr0;
+      }
+    }
+  }
+
+  dbg_eth_rx_desc_ready = ready;
+  addr_rx_buf = first_buffer;
+}
+
+static void eth_reclaim_driver_buffers(void)
+{
+  uint32_t i;
+
+  for (i = 0U; i < ETH_RX_DESC_CNT; i++)
+  {
+    ETH_DMADescTypeDef *desc = (ETH_DMADescTypeDef *)heth.RxDescList.RxDesc[i];
+    if (desc != NULL)
+    {
+      uint32_t buffer = desc->BackupAddr0;
+      desc->BackupAddr0 = 0U;
+      desc->BackupAddr1 = 0U;
+      desc->DESC2 = 0U;
+      if (buffer != 0U)
+      {
+        struct pbuf *p = (struct pbuf *)(buffer - offsetof(RxBuff_t, buff));
+        if (eth_rx_is_driver_owned(p))
+        {
+          pbuf_free(p);
+        }
+      }
+    }
+  }
+
+  struct pbuf *partial_packet = (struct pbuf *)heth.RxDescList.pRxStart;
+  heth.RxDescList.pRxStart = NULL;
+  heth.RxDescList.pRxEnd = NULL;
+  if (partial_packet != NULL && eth_rx_chain_is_driver_owned(partial_packet))
+  {
+    pbuf_free(partial_packet);
+  }
+
+  eth_update_rx_descriptor_count();
+}
+
+static bool eth_prepare_rx_descriptors(void)
+{
+  uint32_t i;
+
+  RxAllocStatus = RX_ALLOC_OK;
+  dbg_eth_rx_alloc_status = RX_ALLOC_OK;
+  for (i = 0U; i < ETH_RX_DESC_CNT; i++)
+  {
+    ETH_DMADescTypeDef *desc = (ETH_DMADescTypeDef *)heth.RxDescList.RxDesc[i];
+    uint8_t *buffer = NULL;
+
+    if (desc == NULL || desc->BackupAddr0 != 0U || desc->DESC2 != 0U)
+    {
+      dbg_eth_rx_invalid_free_cnt++;
+      eth_reclaim_driver_buffers();
+      return false;
+    }
+
+    HAL_ETH_RxAllocateCallback(&buffer);
+    if (buffer == NULL)
+    {
+      eth_reclaim_driver_buffers();
+      return false;
+    }
+
+    desc->BackupAddr0 = (uint32_t)buffer;
+    desc->DESC2 = (uint32_t)buffer;
+  }
+
+  eth_update_rx_descriptor_count();
+  return (dbg_eth_rx_desc_ready == ETH_RX_DESC_CNT &&
+          RxAllocStatus == RX_ALLOC_OK);
+}
+
+static bool eth_dma_is_stopped(void)
+{
+  uint32_t dma_status = heth.Instance->DMASR;
+
+  return ((heth.Instance->DMAOMR & (ETH_DMAOMR_ST | ETH_DMAOMR_SR)) == 0U) &&
+         ((dma_status & (ETH_DMASR_TPS | ETH_DMASR_RPS)) == 0U);
+}
+
+static void eth_release_pending_tx(void)
+{
+  uint32_t i;
+
+  (void)HAL_ETH_ReleaseTxPacket(&heth);
+  for (i = 0U; i < ETH_TX_DESC_CNT; i++)
+  {
+    uint32_t *packet = heth.TxDescList.PacketAddress[i];
+    heth.TxDescList.PacketAddress[i] = NULL;
+    if (packet != NULL)
+    {
+      pbuf_free((struct pbuf *)packet);
+    }
+  }
+
+  heth.TxDescList.BuffersInUse = 0U;
+  heth.TxDescList.releaseIndex = heth.TxDescList.CurTxDesc;
+}
+
+static bool eth_stop_and_reclaim_locked(void)
+{
+  uint32_t start_ms = HAL_GetTick();
+
+  dbg_eth_last_recovery_stage = 1U;
+  if (HAL_ETH_Stop_IT(&heth) != HAL_OK &&
+      (heth.Instance->DMAOMR & (ETH_DMAOMR_ST | ETH_DMAOMR_SR)) != 0U)
+  {
+    return false;
+  }
+
+  while (!eth_dma_is_stopped())
+  {
+    if ((HAL_GetTick() - start_ms) >= ETH_DMA_STOP_TIMEOUT_MS)
+    {
+      return false;
+    }
+    osDelay(1U);
+  }
+
+  HAL_NVIC_DisableIRQ(ETH_IRQn);
+  HAL_NVIC_ClearPendingIRQ(ETH_IRQn);
+  __HAL_ETH_DMA_DISABLE_IT(&heth, ETH_DMAIER_NISE | ETH_DMAIER_RIE |
+                                  ETH_DMAIER_TIE | ETH_DMAIER_FBEIE |
+                                  ETH_DMAIER_AISE | ETH_DMAIER_RBUIE);
+  eth_release_pending_tx();
+  eth_reclaim_driver_buffers();
+  RxAllocStatus = RX_ALLOC_OK;
+  dbg_eth_rx_alloc_status = RX_ALLOC_OK;
+  return true;
+}
+
+static bool eth_start_with_link_config(uint32_t speed, uint32_t duplex)
+{
+  ETH_MACConfigTypeDef mac_config = {0};
+
+  if (g_eth_io_mutex == NULL || RxPktSemaphore == NULL ||
+      TxPktSemaphore == NULL || g_eth_input_thread == NULL)
+  {
+    dbg_eth_last_recovery_stage = 13U;
+    return false;
+  }
+
+  if (HAL_ETH_GetMACConfig(&heth, &mac_config) != HAL_OK)
+  {
+    dbg_eth_last_recovery_stage = 2U;
+    return false;
+  }
+
+  mac_config.DuplexMode = duplex;
+  mac_config.Speed = speed;
+  if (HAL_ETH_SetMACConfig(&heth, &mac_config) != HAL_OK)
+  {
+    dbg_eth_last_recovery_stage = 3U;
+    return false;
+  }
+
+  if (!eth_prepare_rx_descriptors())
+  {
+    dbg_eth_last_recovery_stage = 4U;
+    return false;
+  }
+
+  if (HAL_ETH_Start_IT(&heth) != HAL_OK)
+  {
+    dbg_eth_last_recovery_stage = 5U;
+    return false;
+  }
+
+  eth_update_rx_descriptor_count();
+  if (dbg_eth_rx_desc_ready != ETH_RX_DESC_CNT)
+  {
+    dbg_eth_last_recovery_stage = 6U;
+    return false;
+  }
+
+  HAL_NVIC_ClearPendingIRQ(ETH_IRQn);
+  HAL_NVIC_EnableIRQ(ETH_IRQn);
+  return true;
+}
+
+static bool eth_ensure_runtime_resources(struct netif *netif)
+{
+  osThreadAttr_t attributes = {0};
+
+  if (g_eth_io_mutex == NULL)
+  {
+    g_eth_io_mutex = osMutexNew(NULL);
+  }
+  if (RxPktSemaphore == NULL)
+  {
+    RxPktSemaphore = osSemaphoreNew(1U, 0U, NULL);
+  }
+  if (TxPktSemaphore == NULL)
+  {
+    TxPktSemaphore = osSemaphoreNew(1U, 0U, NULL);
+  }
+  if (g_eth_input_thread == NULL)
+  {
+    attributes.name = "EthIf";
+    attributes.stack_size = INTERFACE_THREAD_STACK_SIZE;
+    attributes.priority = osPriorityHigh;
+    g_eth_input_thread = osThreadNew(ethernetif_input, netif, &attributes);
+  }
+
+  return (g_eth_io_mutex != NULL && RxPktSemaphore != NULL &&
+          TxPktSemaphore != NULL && g_eth_input_thread != NULL);
+}
+
+static bool eth_recover_link(struct netif *netif, uint32_t speed, uint32_t duplex)
+{
+  bool success = false;
+
+  dbg_eth_recovery_attempt_cnt++;
+  dbg_eth_last_recovery_stage = 0U;
+  dbg_eth_link_ready = 0U;
+  netif_set_down(netif);
+  netif_set_link_down(netif);
+
+  if (g_eth_io_mutex == NULL ||
+      osMutexAcquire(g_eth_io_mutex, ETHIF_TX_TIMEOUT) != osOK)
+  {
+    dbg_eth_last_recovery_stage = 7U;
+    goto recovery_done;
+  }
+
+  if (!eth_stop_and_reclaim_locked())
+  {
+    goto release_mutex;
+  }
+
+  dbg_eth_last_recovery_stage = 8U;
+  if (HAL_ETH_DeInit(&heth) != HAL_OK)
+  {
+    dbg_eth_last_recovery_stage = 9U;
+    goto release_mutex;
+  }
+
+  dbg_eth_last_recovery_stage = 10U;
+  if (HAL_ETH_Init(&heth) != HAL_OK)
+  {
+    dbg_eth_last_recovery_stage = 11U;
+    goto release_mutex;
+  }
+
+  if (!eth_start_with_link_config(speed, duplex))
+  {
+    if ((heth.Instance->DMAOMR & (ETH_DMAOMR_ST | ETH_DMAOMR_SR)) != 0U)
+    {
+      (void)eth_stop_and_reclaim_locked();
+    }
+    else
+    {
+      eth_reclaim_driver_buffers();
+    }
+    goto release_mutex;
+  }
+
+  success = true;
+
+release_mutex:
+  osMutexRelease(g_eth_io_mutex);
+
+recovery_done:
+  if (success)
+  {
+    netif_set_up(netif);
+    netif_set_link_up(netif);
+    dbg_eth_link_ready = 1U;
+    dbg_eth_recovery_success_cnt++;
+    dbg_eth_last_recovery_stage = 0U;
+  }
+  else
+  {
+    netif_set_down(netif);
+    netif_set_link_down(netif);
+    dbg_eth_recovery_fail_cnt++;
+  }
+
+  return success;
+}
+
 /**
   * @brief  Ethernet Rx Transfer completed callback
   * @param  handlerEth: ETH handler
@@ -189,7 +623,10 @@ void pbuf_free_custom(struct pbuf *p);
   */
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *handlerEth)
 {
-  osSemaphoreRelease(RxPktSemaphore);
+  if (RxPktSemaphore != NULL)
+  {
+    osSemaphoreRelease(RxPktSemaphore);
+  }
 }
 /**
   * @brief  Ethernet Tx Transfer completed callback
@@ -198,7 +635,10 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *handlerEth)
   */
 void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *handlerEth)
 {
-  osSemaphoreRelease(TxPktSemaphore);
+  if (TxPktSemaphore != NULL)
+  {
+    osSemaphoreRelease(TxPktSemaphore);
+  }
 }
 /**
   * @brief  Ethernet DMA transfer error callback
@@ -207,7 +647,12 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *handlerEth)
   */
 void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *handlerEth)
 {
-  if((HAL_ETH_GetDMAError(handlerEth) & ETH_DMASR_RBUS) == ETH_DMASR_RBUS)
+  uint32_t dma_error = HAL_ETH_GetDMAError(handlerEth);
+
+  dbg_eth_dma_error_cnt++;
+  dbg_eth_last_dma_error = dma_error;
+
+  if((dma_error & ETH_DMASR_RBUS) == ETH_DMASR_RBUS)
   {
      osSemaphoreRelease(RxPktSemaphore);
   }
@@ -232,13 +677,11 @@ static void low_level_init(struct netif *netif)
   addr_rx_desc = (uintptr_t)DMARxDscrTab;
   addr_tx_desc = (uintptr_t)DMATxDscrTab;
 
+  g_eth_io_mutex = osMutexNew(NULL);
+
   HAL_StatusTypeDef hal_eth_init_status = HAL_OK;
-/* USER CODE BEGIN OS_THREAD_ATTR_CMSIS_RTOS_V2 */
-  osThreadAttr_t attributes;
-/* USER CODE END OS_THREAD_ATTR_CMSIS_RTOS_V2 */
   uint32_t duplex, speed = 0;
   int32_t PHYLinkState = 0;
-  ETH_MACConfigTypeDef MACConf = {0};
   /* Start ETH HAL Init */
 
   heth.Instance = ETH;
@@ -288,20 +731,12 @@ static void low_level_init(struct netif *netif)
     netif->flags |= NETIF_FLAG_BROADCAST;
   #endif /* LWIP_ARP */
 
-  /* create a binary semaphore used for informing ethernetif of frame reception */
-  RxPktSemaphore = osSemaphoreNew(1, 0, NULL);
-
-  /* create a binary semaphore used for informing ethernetif of frame transmission */
-  TxPktSemaphore = osSemaphoreNew(1, 0, NULL);
-
-  /* create the task that handles the ETH_MAC */
-/* USER CODE BEGIN OS_THREAD_NEW_CMSIS_RTOS_V2 */
-  memset(&attributes, 0x0, sizeof(osThreadAttr_t));
-  attributes.name = "EthIf";
-  attributes.stack_size = INTERFACE_THREAD_STACK_SIZE;
-  attributes.priority = osPriorityHigh;
-  osThreadNew(ethernetif_input, netif, &attributes);
-/* USER CODE END OS_THREAD_NEW_CMSIS_RTOS_V2 */
+  if (!eth_ensure_runtime_resources(netif))
+  {
+    dbg_eth_last_recovery_stage = 12U;
+    netif_set_down(netif);
+    netif_set_link_down(netif);
+  }
 
 /* USER CODE BEGIN PHY_PRE_CONFIG */
 
@@ -353,17 +788,29 @@ static void low_level_init(struct netif *netif)
         break;
       }
 
-    /* Get MAC Config MAC */
-    HAL_ETH_GetMACConfig(&heth, &MACConf);
-    MACConf.DuplexMode = duplex;
-    MACConf.Speed = speed;
-    HAL_ETH_SetMACConfig(&heth, &MACConf);
-
-    //volatile HAL_StatusTypeDef g_eth_start_status;
-    //g_eth_start_status = HAL_ETH_Start_IT(&heth);
-    HAL_ETH_Start_IT(&heth);
-    netif_set_up(netif);
-    netif_set_link_up(netif);
+    if (g_eth_io_mutex != NULL &&
+        osMutexAcquire(g_eth_io_mutex, ETHIF_TX_TIMEOUT) == osOK)
+    {
+      if (eth_start_with_link_config(speed, duplex))
+      {
+        netif_set_up(netif);
+        netif_set_link_up(netif);
+        dbg_eth_link_ready = 1U;
+      }
+      else
+      {
+        if ((heth.Instance->DMAOMR & (ETH_DMAOMR_ST | ETH_DMAOMR_SR)) != 0U)
+        {
+          (void)eth_stop_and_reclaim_locked();
+        }
+        else
+        {
+          eth_reclaim_driver_buffers();
+        }
+        dbg_eth_link_ready = 0U;
+      }
+      osMutexRelease(g_eth_io_mutex);
+    }
 
 /* USER CODE BEGIN PHY_POST_CONFIG */
 
@@ -373,7 +820,9 @@ static void low_level_init(struct netif *netif)
   }
   else
   {
-    Error_Handler();
+    dbg_eth_link_ready = 0U;
+    netif_set_link_down(netif);
+    netif_set_down(netif);
   }
 #endif /* LWIP_ARP || LWIP_ETHERNET */
 
@@ -402,6 +851,7 @@ static void low_level_init(struct netif *netif)
 static err_t low_level_output(struct netif *netif, struct pbuf *p)
 {
   uint32_t i = 0U;
+  uint32_t tx_start_ms;
   struct pbuf *q = NULL;
   err_t errval = ERR_OK;
   ETH_BufferTypeDef Txbuffer[ETH_TX_DESC_CNT] = {0};
@@ -429,9 +879,21 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
     i++;
   }
 
+  if (g_eth_io_mutex == NULL ||
+      osMutexAcquire(g_eth_io_mutex, ETHIF_TX_TIMEOUT) != osOK)
+  {
+    return ERR_IF;
+  }
+  if (dbg_eth_link_ready == 0U || heth.gState != HAL_ETH_STATE_STARTED)
+  {
+    osMutexRelease(g_eth_io_mutex);
+    return ERR_IF;
+  }
+
   TxConfig.Length = p->tot_len;
   TxConfig.TxBuffer = Txbuffer;
   TxConfig.pData = p;
+  tx_start_ms = HAL_GetTick();
 
   pbuf_ref(p);
 
@@ -447,9 +909,19 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
       if(HAL_ETH_GetError(&heth) & HAL_ETH_ERROR_BUSY)
       {
         /* Wait for descriptors to become available */
-        osSemaphoreAcquire(  TxPktSemaphore, ETHIF_TX_TIMEOUT);
+        osStatus_t tx_wait_status =
+          osSemaphoreAcquire(TxPktSemaphore, ETHIF_TX_TIMEOUT);
         HAL_ETH_ReleaseTxPacket(&heth);
-        errval = ERR_BUF;
+        if (tx_wait_status != osOK &&
+            (HAL_GetTick() - tx_start_ms) >= ETHIF_TX_TIMEOUT)
+        {
+          pbuf_free(p);
+          errval = ERR_IF;
+        }
+        else
+        {
+          errval = ERR_BUF;
+        }
       }
       else
       {
@@ -460,6 +932,7 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
     }
   }while(errval == ERR_BUF);
 
+  osMutexRelease(g_eth_io_mutex);
   return errval;
 }
 
@@ -475,9 +948,19 @@ static struct pbuf * low_level_input(struct netif *netif)
 {
   struct pbuf *p = NULL;
 
-  if(RxAllocStatus == RX_ALLOC_OK)
+  if (g_eth_io_mutex != NULL &&
+      osMutexAcquire(g_eth_io_mutex, ETHIF_TX_TIMEOUT) == osOK)
   {
-    HAL_ETH_ReadData(&heth, (void **)&p);
+    if (RxAllocStatus == RX_ALLOC_OK)
+    {
+      (void)HAL_ETH_ReadData(&heth, (void **)&p);
+      eth_update_rx_descriptor_count();
+      if (p != NULL)
+      {
+        (void)eth_rx_track_transfer_to_lwip(p);
+      }
+    }
+    osMutexRelease(g_eth_io_mutex);
   }
 
   return p;
@@ -603,6 +1086,28 @@ err_t ethernetif_init(struct netif *netif)
 void pbuf_free_custom(struct pbuf *p)
 {
   struct pbuf_custom* custom_pbuf = (struct pbuf_custom*)p;
+  uint32_t primask = eth_enter_critical();
+  int32_t slot = eth_rx_track_find(custom_pbuf);
+
+  if (slot < 0)
+  {
+    dbg_eth_rx_invalid_free_cnt++;
+    eth_exit_critical(primask);
+    return;
+  }
+
+  g_rx_buffers[slot].pbuf = NULL;
+  g_rx_buffers[slot].owner = 0U;
+  if (dbg_eth_rx_pool_in_use > 0U)
+  {
+    dbg_eth_rx_pool_in_use--;
+  }
+  else
+  {
+    dbg_eth_rx_invalid_free_cnt++;
+  }
+  eth_exit_critical(primask);
+
   LWIP_MEMPOOL_FREE(RX_POOL, custom_pbuf);
 
   /* If the Rx Buffer Pool was exhausted, signal the ethernetif_input task to
@@ -611,6 +1116,7 @@ void pbuf_free_custom(struct pbuf *p)
   if (RxAllocStatus == RX_ALLOC_ERROR)
   {
     RxAllocStatus = RX_ALLOC_OK;
+    dbg_eth_rx_alloc_status = RX_ALLOC_OK;
     osSemaphoreRelease(RxPktSemaphore);
   }
 }
@@ -814,289 +1320,122 @@ int32_t ETH_PHY_IO_GetTick(void)
   * @brief  Check the ETH link state then update ETH driver and netif link accordingly.
   * @retval None
   */
+static bool eth_get_link_config(int32_t phy_state, uint32_t *speed, uint32_t *duplex)
+{
+  switch (phy_state)
+  {
+    case LAN8742_STATUS_100MBITS_FULLDUPLEX:
+      *speed = ETH_SPEED_100M;
+      *duplex = ETH_FULLDUPLEX_MODE;
+      return true;
+    case LAN8742_STATUS_100MBITS_HALFDUPLEX:
+      *speed = ETH_SPEED_100M;
+      *duplex = ETH_HALFDUPLEX_MODE;
+      return true;
+    case LAN8742_STATUS_10MBITS_FULLDUPLEX:
+      *speed = ETH_SPEED_10M;
+      *duplex = ETH_FULLDUPLEX_MODE;
+      return true;
+    case LAN8742_STATUS_10MBITS_HALFDUPLEX:
+      *speed = ETH_SPEED_10M;
+      *duplex = ETH_HALFDUPLEX_MODE;
+      return true;
+    default:
+      return false;
+  }
+}
+
 void ethernet_link_thread(void* argument)
 {
-    ETH_MACConfigTypeDef MACConf = {0};
-    int32_t PHYLinkState = 0;
-    uint32_t linkchanged = 0U;
-    uint32_t speed = 0U;
-    uint32_t duplex = 0U;
+  struct netif *netif = (struct netif *)argument;
+  uint32_t speed = ETH_SPEED_100M;
+  uint32_t duplex = ETH_FULLDUPLEX_MODE;
+  uint32_t last_recovery_ms = HAL_GetTick() - ETH_RECOVERY_RETRY_MS;
+  uint8_t link_up_stable_count = 0U;
+  bool recovery_pending = false;
 
-    /*
-     * Thread chạy mỗi 100 ms.
-     * PHY phải UP ổn định 5 vòng (~500 ms)
-     * trước khi normal link recovery.
-     */
-    uint8_t link_up_stable_count = 0U;
-
-    struct netif *netif = (struct netif *)argument;
-
-    /* USER CODE BEGIN ETH link init */
-
-    /* USER CODE END ETH link init */
-
-    for (;;)
+  for (;;)
+  {
+    if (!eth_ensure_runtime_resources(netif))
     {
-        linkchanged = 0U;
+      dbg_eth_last_recovery_stage = 12U;
+      osDelay(100U);
+      continue;
+    }
 
-        PHYLinkState = LAN8742_GetLinkState(&LAN8742);
+    int32_t phy_state = LAN8742_GetLinkState(&LAN8742);
+    bool phy_up = phy_state > LAN8742_STATUS_LINK_DOWN;
+    bool link_up = netif_is_link_up(netif);
 
-        /* =====================================================
-         * 1. PHY LINK DOWN
-         * ===================================================== */
-        if (netif_is_link_up(netif) &&
-            (PHYLinkState <= LAN8742_STATUS_LINK_DOWN))
+    if (g_eth_force_recovery != 0U)
+    {
+      g_eth_force_recovery = 0U;
+      recovery_pending = true;
+    }
+
+    if (!phy_up)
+    {
+      link_up_stable_count = 0U;
+      if (link_up)
+      {
+        netif_set_down(netif);
+        netif_set_link_down(netif);
+        dbg_eth_link_ready = 0U;
+
+        if (g_eth_io_mutex != NULL &&
+            osMutexAcquire(g_eth_io_mutex, ETHIF_TX_TIMEOUT) == osOK)
         {
-            link_up_stable_count = 0U;
-
-            /*
-             * Nếu link vật lý thật sự DOWN,
-             * normal reconnect sẽ xử lý.
-             */
-            g_eth_force_recovery = 0U;
-
-            HAL_ETH_Stop_IT(&heth);
-
-            netif_set_down(netif);
-            netif_set_link_down(netif);
+          if (!eth_stop_and_reclaim_locked())
+          {
+            dbg_eth_recovery_fail_cnt++;
+          }
+          osMutexRelease(g_eth_io_mutex);
         }
-
-        /* =====================================================
-         * 2. PHY đã UP nhưng LwIP vẫn DOWN
-         *    Rút/cắm dây Ethernet
-         * ===================================================== */
-        else if (!netif_is_link_up(netif) &&
-                 (PHYLinkState > LAN8742_STATUS_LINK_DOWN))
-        {
-            if (link_up_stable_count < 5U)
-            {
-                link_up_stable_count++;
-            }
-
-            if (link_up_stable_count >= 5U)
-            {
-                link_up_stable_count = 0U;
-
-                switch (PHYLinkState)
-                {
-                    case LAN8742_STATUS_100MBITS_FULLDUPLEX:
-                        duplex = ETH_FULLDUPLEX_MODE;
-                        speed = ETH_SPEED_100M;
-                        linkchanged = 1U;
-                        break;
-
-                    case LAN8742_STATUS_100MBITS_HALFDUPLEX:
-                        duplex = ETH_HALFDUPLEX_MODE;
-                        speed = ETH_SPEED_100M;
-                        linkchanged = 1U;
-                        break;
-
-                    case LAN8742_STATUS_10MBITS_FULLDUPLEX:
-                        duplex = ETH_FULLDUPLEX_MODE;
-                        speed = ETH_SPEED_10M;
-                        linkchanged = 1U;
-                        break;
-
-                    case LAN8742_STATUS_10MBITS_HALFDUPLEX:
-                        duplex = ETH_HALFDUPLEX_MODE;
-                        speed = ETH_SPEED_10M;
-                        linkchanged = 1U;
-                        break;
-
-                    default:
-                        linkchanged = 0U;
-                        break;
-                }
-
-                if (linkchanged)
-                {
-                    HAL_ETH_Stop_IT(&heth);
-
-                    if (HAL_ETH_DeInit(&heth) != HAL_OK)
-                    {
-                    	netif_set_down(netif);
-                    	netif_set_link_down(netif);
-                    	link_up_stable_count = 0U;
-                    	osDelay(1000);
-                    	continue;
-                    }
-
-                    if (HAL_ETH_Init(&heth) != HAL_OK)
-                    {
-                    	netif_set_down(netif);
-                    	netif_set_link_down(netif);
-                    	link_up_stable_count = 0U;
-                    	osDelay(1000);
-                    	continue;
-                    }
-
-                    RxAllocStatus = RX_ALLOC_OK;
-
-                    HAL_ETH_GetMACConfig(
-                        &heth,
-                        &MACConf
-                    );
-
-                    MACConf.DuplexMode = duplex;
-                    MACConf.Speed = speed;
-
-                    if (HAL_ETH_SetMACConfig(&heth, &MACConf) != HAL_OK)
-                    {
-                    	HAL_ETH_Stop_IT(&heth);
-
-                    	netif_set_down(netif);
-                    	netif_set_link_down(netif);
-
-                    	link_up_stable_count = 0U;
-
-                    	osDelay(1000);
-                    	continue;
-                    }
-
-                    if (HAL_ETH_Start_IT(&heth) != HAL_OK)
-                    {
-                    	HAL_ETH_Stop_IT(&heth);
-
-                    	netif_set_down(netif);
-                    	netif_set_link_down(netif);
-
-                    	link_up_stable_count = 0U;
-
-                    	osDelay(1000);
-                    	continue;
-                    }
-
-                    netif_set_up(netif);
-                    netif_set_link_up(netif);
-
-                    linkchanged = 0U;
-                }
-            }
-        }
-
-        /* =====================================================
-         * 3. FORCE RECOVERY
-         *
-         * PHY vẫn báo UP nhưng Ethernet thực tế chết.
-         * Đây là case mini-PC reboot.
-         * ===================================================== */
-        else if (g_eth_force_recovery &&
-                 (PHYLinkState > LAN8742_STATUS_LINK_DOWN))
-        {
-            g_eth_force_recovery = 0U;
-            link_up_stable_count = 0U;
-
-            /*
-             * Báo LwIP DOWN trước khi reset MAC/DMA.
-             */
-            netif_set_down(netif);
-            netif_set_link_down(netif);
-
-            HAL_ETH_Stop_IT(&heth);
-
-            if (HAL_ETH_DeInit(&heth) != HAL_OK)
-            {
-            	netif_set_down(netif);
-            	netif_set_link_down(netif);
-            	link_up_stable_count = 0U;
-            	osDelay(1000);
-            	continue;
-            }
-
-            if (HAL_ETH_Init(&heth) != HAL_OK)
-            {
-            	netif_set_down(netif);
-            	netif_set_link_down(netif);
-            	link_up_stable_count = 0U;
-            	osDelay(1000);
-            	continue;
-            }
-
-            RxAllocStatus = RX_ALLOC_OK;
-
-            switch (PHYLinkState)
-            {
-                case LAN8742_STATUS_100MBITS_FULLDUPLEX:
-                    duplex = ETH_FULLDUPLEX_MODE;
-                    speed = ETH_SPEED_100M;
-                    break;
-
-                case LAN8742_STATUS_100MBITS_HALFDUPLEX:
-                    duplex = ETH_HALFDUPLEX_MODE;
-                    speed = ETH_SPEED_100M;
-                    break;
-
-                case LAN8742_STATUS_10MBITS_FULLDUPLEX:
-                    duplex = ETH_FULLDUPLEX_MODE;
-                    speed = ETH_SPEED_10M;
-                    break;
-
-                case LAN8742_STATUS_10MBITS_HALFDUPLEX:
-                    duplex = ETH_HALFDUPLEX_MODE;
-                    speed = ETH_SPEED_10M;
-                    break;
-
-                default:
-                    duplex = ETH_FULLDUPLEX_MODE;
-                    speed = ETH_SPEED_100M;
-                    break;
-            }
-
-            HAL_ETH_GetMACConfig(
-                &heth,
-                &MACConf
-            );
-
-            MACConf.DuplexMode = duplex;
-            MACConf.Speed = speed;
-
-            if (HAL_ETH_SetMACConfig(&heth, &MACConf) != HAL_OK)
-            {
-            	HAL_ETH_Stop_IT(&heth);
-
-            	netif_set_down(netif);
-            	netif_set_link_down(netif);
-
-            	link_up_stable_count = 0U;
-
-            	osDelay(1000);
-            	continue;
-            }
-
-            if (HAL_ETH_Start_IT(&heth) != HAL_OK)
-            {
-            	HAL_ETH_Stop_IT(&heth);
-
-            	netif_set_down(netif);
-            	netif_set_link_down(netif);
-
-                link_up_stable_count = 0U;
-
-            	osDelay(1000);
-            	continue;
-            }
-
-            netif_set_up(netif);
-            netif_set_link_up(netif);
-        }
-
-        /* =====================================================
-         * 4. Không có gì cần xử lý
-         * ===================================================== */
         else
         {
-            if (PHYLinkState <= LAN8742_STATUS_LINK_DOWN)
-            {
-                link_up_stable_count = 0U;
-            }
+          dbg_eth_recovery_fail_cnt++;
+          dbg_eth_last_recovery_stage = 7U;
         }
-
-        /* USER CODE BEGIN ETH link Thread core code for User BSP */
-
-        /* USER CODE END ETH link Thread core code for User BSP */
-
-        osDelay(100);
+      }
     }
+    else
+    {
+      if (!link_up)
+      {
+        if (link_up_stable_count < 5U)
+        {
+          link_up_stable_count++;
+        }
+        if (link_up_stable_count >= 5U)
+        {
+          recovery_pending = true;
+        }
+      }
+      else if (!recovery_pending)
+      {
+        link_up_stable_count = 0U;
+      }
+
+      if (recovery_pending &&
+          (link_up || link_up_stable_count >= 5U) &&
+          (HAL_GetTick() - last_recovery_ms) >= ETH_RECOVERY_RETRY_MS)
+      {
+        last_recovery_ms = HAL_GetTick();
+        if (eth_get_link_config(phy_state, &speed, &duplex) &&
+            eth_recover_link(netif, speed, duplex))
+        {
+          recovery_pending = false;
+          link_up_stable_count = 0U;
+        }
+        else
+        {
+          link_up_stable_count = 0U;
+        }
+      }
+    }
+
+    osDelay(100U);
+  }
 }
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
@@ -1112,10 +1451,20 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
     * This must be performed whenever a buffer's allocated because it may be
     * changed by lwIP or the app, e.g., pbuf_free decrements ref. */
     pbuf_alloced_custom(PBUF_RAW, 0, PBUF_REF, p, *buff, ETH_RX_BUF_SIZE);
+    if (!eth_rx_track_add(p))
+    {
+      dbg_eth_rx_alloc_fail_cnt++;
+      RxAllocStatus = RX_ALLOC_ERROR;
+      dbg_eth_rx_alloc_status = RX_ALLOC_ERROR;
+      *buff = NULL;
+      LWIP_MEMPOOL_FREE(RX_POOL, p);
+    }
   }
   else
   {
+    dbg_eth_rx_alloc_fail_cnt++;
     RxAllocStatus = RX_ALLOC_ERROR;
+    dbg_eth_rx_alloc_status = RX_ALLOC_ERROR;
     *buff = NULL;
   }
 /* USER CODE END HAL ETH RxAllocateCallback */
@@ -1173,4 +1522,3 @@ void HAL_ETH_TxFreeCallback(uint32_t * buff)
 /* USER CODE BEGIN 8 */
 
 /* USER CODE END 8 */
-
